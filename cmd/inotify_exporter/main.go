@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/rjeczalik/notify"
@@ -33,6 +34,16 @@ var (
 
 type iNotifyLogger struct {
 	*os.File
+}
+
+func addSubDirs(rootDir string, l notify.EventInfo) {
+	filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			fmt.Printf("Adding subdir %s %#v\n", path, info)
+			watcher.WatchFlags(path, FSN_MOST)
+		}
+		return nil
+	})
 }
 
 func NewLogger(t time.Time) (*iNotifyLogger, error) {
@@ -220,10 +231,13 @@ func watchDay(dayDir string) error {
 func main() {
 	flag.Parse()
 	// Watch root dir.
-	// Immediately add watches to current date for:
+	// If first start, immediately add watches for current date, if present:
 	// * YYYY
 	// * YYYY/MM
 	// * YYYY/MM/DD
+	//
+	// Then wait.
+	//
 	// When we add a new month or add a new day, we can stop monitoring the
 	// previous one shortly after.
 	// So, at all times, there should be at least:
