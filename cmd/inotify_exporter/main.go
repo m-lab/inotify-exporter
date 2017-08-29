@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -37,16 +36,6 @@ var (
 type iNotifyLogger struct {
 	*os.File
 }
-
-/*func addSubDirs(rootDir string, l notify.EventInfo) {
-	filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if info.IsDir() {
-			fmt.Printf("Adding subdir %s %#v\n", path, info)
-			watcher.WatchFlags(path, FSN_MOST)
-		}
-		return nil
-	})
-}*/
 
 // which comes first the date or the directory?
 func currentDir(t time.Time) string {
@@ -64,12 +53,17 @@ func fixedRFC3339Nano(t time.Time) string {
 
 func NewLogger(t time.Time) (*iNotifyLogger, error) {
 	// For example: 20170828T14:27:27.480836000Z.inotify.log
-	fname := fmt.Sprintf("%04d/%02d/%02d/%04d%02d%02dT%02d:%02d:%02d.%09dZ.inotify.log",
-		t.Year(), (int)(t.Month()), t.Day(),
-		t.Year(), (int)(t.Month()), t.Day(),
-		t.Hour(), t.Minute(), t.Second(), t.Nanosecond())
+	d, err := os.Getwd()
+	os.Chdir("2017/08/29")
+	// fname := fmt.Sprintf("%s/%04d/%02d/%02d/%04d%02d%02dT%02d%02d%02d.%09dZ.inotify.log",
+	fname := fmt.Sprintf("%04d%02d%02dT%02d%02d%02d.%09dZ.inotify.log",
+		//d,
+		//t.Year(), (int)(t.Month()), t.Day(),
+		t.Year(), (int)(t.Month()), t.Day(), t.Hour(), 0, 0, 0)
 
-	file, err := os.Create(fname)
+	fmt.Fprintf(os.Stdout, "Creating: %s\n", fname)
+	fmt.Fprintf(os.Stdout, "pwd: %s %s\n", d, err)
+	file, err := os.OpenFile(fname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -83,12 +77,6 @@ func (l *iNotifyLogger) Event(date time.Time, event notify.EventInfo, count int)
 	fmt.Fprintf(l, msg)
 	fmt.Printf(msg)
 }
-
-// TODO: notify supports "recursive" watchpoints. Need to test this to check for
-// resource leaks.
-// if err := notify.Watch("./...", c, notify.Remove); err != nil {
-//     log.Fatal(err)
-// }
 
 func watch(dir string, startTime, until time.Time,
 	onEvent func(t time.Time, ev notify.EventInfo) error) error {
@@ -157,68 +145,6 @@ func waitUntil(startTime time.Time, d int) time.Time {
 	}
 }
 
-func watchRoot(t time.Time, rootDir string) error {
-	watch(rootDir, t, waitUntil(t, nextRagnarok),
-		func(t time.Time, ev notify.EventInfo) error {
-			switch ev.Event() {
-			case notify.InCreate:
-				// Only watch new directories that match the current year.
-				curYear := fmt.Sprintf("%04d", t.Year())
-				newYear := filepath.Base(ev.Path())
-				if curYear == newYear {
-					fmt.Println("Watching new year created!", newYear)
-					go watchCurrentYear(t, ev.Path())
-				}
-			}
-			fmt.Println("root event!", ev)
-			return nil
-		},
-	)
-	return nil
-}
-
-func watchCurrentYear(t time.Time, dir string) error {
-	watch(dir, t, waitUntil(t, nextYear),
-		// onEvent
-		func(t time.Time, ev notify.EventInfo) error {
-			switch ev.Event() {
-			case notify.InCreate:
-				// Only watch new directories that match the current month.
-				curMonth := fmt.Sprintf("%02d", (int)(t.Month()))
-				newMonth := filepath.Base(ev.Path())
-				if curMonth == newMonth {
-					fmt.Println("Watching new month created!", newMonth)
-					go watchCurrentMonth(t, ev.Path())
-				}
-			}
-			// fmt.Println("Year event!", ev)
-			return nil
-		},
-	)
-	return nil
-}
-
-func watchCurrentMonth(t time.Time, dir string) error {
-	watch(dir, t, waitUntil(t, nextMonth),
-		// onEvent
-		func(t time.Time, ev notify.EventInfo) error {
-			switch ev.Event() {
-			case notify.InCreate:
-				// Only watch new directories that match the current month.
-				curDay := fmt.Sprintf("%02d", t.Day())
-				newDay := filepath.Base(ev.Path())
-				if curDay == newDay {
-					fmt.Println("Watching new day created!", newDay)
-					go watchCurrentDay(t, ev.Path())
-				}
-			}
-			// fmt.Println("Month event!", ev)
-			return nil
-		},
-	)
-	return nil
-}
-
 func isDir(ev notify.EventInfo) bool {
 	unixEv, ok := ev.Sys().(*unix.InotifyEvent)
 	if !ok {
@@ -228,41 +154,46 @@ func isDir(ev notify.EventInfo) bool {
 }
 
 func watchCurrentDay(t time.Time, dir string) error {
-
-	if !strings.HasSuffix(dir, currentDir(t)) {
-		fmt.Printf("%s does not have expected suffix %s\n", dir, currentDir(t))
-		return fmt.Errorf("%s does not have expected suffix %s\n", dir, currentDir(t))
-	}
-
-	logger, err := NewLogger(t)
-	if err != nil {
-		return err
-	}
-
 	fileCount := 0
 	// Setup a recursive watch on the day directory.
-	watch(fmt.Sprintf("%s/...", dir), t, waitUntil(t, nextDay),
+	watch(fmt.Sprintf("%s/...", dir), t, waitUntil(t, nextRagnarok),
 		// onEvent
 		func(t time.Time, ev notify.EventInfo) error {
 			// TODO:can we distinguish between files and dirs on delete
 			// events?
 			// Only count files.
 			if !isDir(ev) {
-				switch ev.Event() {
-				case notify.InCreate:
-					fileCount += 1
-				case notify.InDelete:
-					fileCount -= 1
-				default:
-					// No change.
+				p := ev.Path()
+				shortPath := p[len(dir)+1:]
+
+				fmt.Fprintln(os.Stdout, "shortPath:", shortPath)
+				fmt.Fprintln(os.Stdout, "currentDir:", currentDir(t))
+				if strings.HasPrefix(shortPath, currentDir(t)) {
+					// Then this is a file event under a directory we care about.
+					fmt.Fprintln(os.Stdout, "Look up logger for:", currentDir(t))
+					logger, err := NewLogger(t)
+					if err != nil {
+						log.Fatal(err)
+					}
+					switch ev.Event() {
+					case notify.InCreate:
+						fileCount += 1
+					case notify.InDelete:
+						fileCount -= 1
+					default:
+						// No change.
+					}
+					// fmt.Println("Day event!", ev)
+					logger.Event(t, ev, fileCount)
+					// logger.Close()
+				} else {
+					fmt.Fprintln(os.Stdout, "Skipping event for: %s", ev)
 				}
 			}
-			// fmt.Println("Day event!", ev)
-			logger.Event(t, ev, fileCount)
 			return nil
 		},
 	)
-	logger.Close()
+	// TODO: we never close the loggers...
 	return nil
 }
 
@@ -293,7 +224,8 @@ func main() {
 	fmt.Printf("Watching: %s\n", *rootPath)
 	for {
 		start := time.Now().UTC()
-		err := watchRoot(start, *rootPath)
+		// err := watchRoot(start, *rootPath)
+		err := watchCurrentDay(start, *rootPath)
 		if err != nil {
 			log.Fatal(err)
 		}
