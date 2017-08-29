@@ -23,9 +23,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rjeczalik/notify"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -36,7 +38,7 @@ type iNotifyLogger struct {
 	*os.File
 }
 
-func addSubDirs(rootDir string, l notify.EventInfo) {
+/*func addSubDirs(rootDir string, l notify.EventInfo) {
 	filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 		if info.IsDir() {
 			fmt.Printf("Adding subdir %s %#v\n", path, info)
@@ -44,6 +46,20 @@ func addSubDirs(rootDir string, l notify.EventInfo) {
 		}
 		return nil
 	})
+}*/
+
+// which comes first the date or the directory?
+func currentDir(t time.Time) string {
+	return fmt.Sprintf("%04d/%02d/%02d", t.Year(), (int)(t.Month()), t.Day())
+}
+
+// fixedRFC3339Nano guarantees a fixed format RFC3339 time format. The Go
+// time.Format function does not provide this guarantee because it trims
+// trailing zeros.
+func fixedRFC3339Nano(t time.Time) string {
+	return fmt.Sprintf("%04d-%02d-%02dT%02d:%02d:%02d.%09dZ",
+		t.Year(), (int)(t.Month()), t.Day(),
+		t.Hour(), t.Minute(), t.Second(), t.Nanosecond())
 }
 
 func NewLogger(t time.Time) (*iNotifyLogger, error) {
@@ -61,33 +77,46 @@ func NewLogger(t time.Time) (*iNotifyLogger, error) {
 }
 
 func (l *iNotifyLogger) Event(date time.Time, event notify.EventInfo, count int) {
-	// msg := fmt.Sprintf(
-	// 	"%s %s %s %d\n", date.Format(time.RFC3339Nano), event.Event(), event.Path(), count)
-	// fmt.Fprintf(l, msg)
-	// fmt.Printf(msg)
-	fmt.Fprintf(l,
-		"%s %s %s %d\n", date.Format(time.RFC3339Nano), event.Event(), event.Path(), count)
+	p := event.Path()
+	msg := fmt.Sprintf(
+		"%s %s %s %d\n", fixedRFC3339Nano(date), event.Event(), p[len(*rootPath)+1:], count)
+	fmt.Fprintf(l, msg)
+	fmt.Printf(msg)
 }
 
-func watchEventsForever(l chan notify.EventInfo) error {
-	// <datetime> <event> <file-count> <filename> [other metadata]\n
-	fileCount := 0
+// TODO: notify supports "recursive" watchpoints. Need to test this to check for
+// resource leaks.
+// if err := notify.Watch("./...", c, notify.Remove); err != nil {
+//     log.Fatal(err)
+// }
 
-	startTime := time.Now().UTC()
-	// Calculate a time when watching should stop.
-	endTime := time.Date(
-		startTime.Year(), startTime.Month(), startTime.Day()+1,
-		1, 0, 0, 0, time.UTC)
-	// endtime should always be larger than t.
-	waitTime := endTime.Sub(startTime)
-	// TODO: log the wait time.
-	alarm := time.After(waitTime)
+func watch(dir string, startTime, until time.Time,
+	onEvent func(t time.Time, ev notify.EventInfo) error) error {
 
-	// TODO: we must guarantee that the day directory matches the start time.
-	logger, err := NewLogger(startTime)
+	// Make the channel buffered to ensure no event is dropped. Notify will
+	// drop events if the receiver does not keep up.
+	l := make(chan notify.EventInfo, 128)
+
+	err := notify.Watch(dir, l, notify.InCreate, notify.InDelete, notify.InCloseWrite)
 	if err != nil {
 		return err
 	}
+
+	// TODO: do we need to handle the Stop case?
+	defer notify.Stop(l)
+
+	// TODO: check that until is larger than starttime.
+	// The until time should always be larger than now.
+	waitTime := until.Sub(startTime)
+	// TODO: log the wait time.
+	fmt.Printf("Watching until: %s\n", waitTime)
+	alarm := time.After(waitTime)
+
+	// TODO: we must guarantee that the day directory matches the start time.
+	// logger, err := NewLogger(startTime)
+	// if err != nil {
+	// 	return err
+	// }
 
 	// TODO: vim on save, causes an InCreate event but no corresponding
 	// InDelete. This results in the count increasing without the number of
@@ -97,140 +126,150 @@ func watchEventsForever(l chan notify.EventInfo) error {
 		select {
 		case ev := <-l:
 			t := time.Now().UTC()
-			switch ev.Event() {
-			case notify.InCreate:
-				fmt.Printf("watchDay saw: %s\n", ev.Path())
-				fileCount += 1
-			case notify.InDelete:
-				fileCount -= 1
-			default:
-				// No change.
-			}
-			logger.Event(t, ev, fileCount)
+			onEvent(t, ev)
 		case <-alarm:
-			// We believe that there should be no more file events that we want to log.
-			// So, stop this.
-			logger.Close()
-			// TODO: close log file.
 			return nil
 		}
 	}
+	return nil
 }
 
-// TODO: notify supports "recursive" watchpoints. Need to test this to check for
-// resource leaks.
-// if err := notify.Watch("./...", c, notify.Remove); err != nil {
-//     log.Fatal(err)
-// }
+const (
+	nextDay int = iota
+	nextMonth
+	nextYear
+	nextRagnarok
+)
 
-func watchRoot(rootDir string, start time.Time) error {
-	l := make(chan notify.EventInfo, 16)
-	// Watch for new month directories created in the root dir.
-	err := notify.Watch(rootDir, l, notify.InCreate)
-	if err != nil {
-		return err
+// waitUntil returns a time.Time of the next calendar day, month or year, plus one hour.
+func waitUntil(startTime time.Time, d int) time.Time {
+	// Note: time.Date normalizes dates; e.g. October 32 converts to November 1.
+	switch d {
+	case nextDay:
+		return time.Date(startTime.Year(), startTime.Month(), startTime.Day()+1, 1, 0, 0, 0, time.UTC)
+	case nextMonth:
+		return time.Date(startTime.Year(), startTime.Month()+1, startTime.Day(), 1, 0, 0, 0, time.UTC)
+	case nextYear:
+		return time.Date(startTime.Year()+1, startTime.Month(), startTime.Day(), 1, 0, 0, 0, time.UTC)
+	default:
+		// Far into the future.
+		return time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
-	defer notify.Stop(l)
+}
 
-	for {
-		select {
-		case ev := <-l:
-			// now := time.Now().UTC()
+func watchRoot(t time.Time, rootDir string) error {
+	watch(rootDir, t, waitUntil(t, nextRagnarok),
+		func(t time.Time, ev notify.EventInfo) error {
 			switch ev.Event() {
 			case notify.InCreate:
-				fmt.Printf("watchRoot saw: %s\n", ev.Path())
-				go watchYear(ev.Path())
-				fmt.Printf("watching year\n")
-				// if err != nil {
-				// 	// TODO: how to continue watching?
-				// 	return err
-				// }
-			default:
-				// No change.
+				// Only watch new directories that match the current year.
+				curYear := fmt.Sprintf("%04d", t.Year())
+				newYear := filepath.Base(ev.Path())
+				if curYear == newYear {
+					fmt.Println("Watching new year created!", newYear)
+					go watchCurrentYear(t, ev.Path())
+				}
 			}
-		}
-	}
+			fmt.Println("root event!", ev)
+			return nil
+		},
+	)
+	return nil
 }
 
-func watchYear(yearDir string) error {
-	l := make(chan notify.EventInfo, 16)
-	// Watch for new month directories created in the year dir.
-	err := notify.Watch(yearDir, l, notify.InCreate)
-	if err != nil {
-		return err
-	}
-	defer notify.Stop(l)
-
-	for {
-		select {
-		case ev := <-l:
-			// now := time.Now().UTC()
+func watchCurrentYear(t time.Time, dir string) error {
+	watch(dir, t, waitUntil(t, nextYear),
+		// onEvent
+		func(t time.Time, ev notify.EventInfo) error {
 			switch ev.Event() {
 			case notify.InCreate:
-				fmt.Printf("watchYear saw: %s\n", ev.Path())
-				go watchMonth(ev.Path())
-				fmt.Printf("watching month\n")
-				// if err != nil {
-				// 	// TODO: how to continue watching?
-				// 	return err
-				// }
-			default:
-				// No change.
+				// Only watch new directories that match the current month.
+				curMonth := fmt.Sprintf("%02d", (int)(t.Month()))
+				newMonth := filepath.Base(ev.Path())
+				if curMonth == newMonth {
+					fmt.Println("Watching new month created!", newMonth)
+					go watchCurrentMonth(t, ev.Path())
+				}
 			}
-		}
-	}
+			// fmt.Println("Year event!", ev)
+			return nil
+		},
+	)
+	return nil
 }
 
-func watchMonth(monthDir string) error {
-	l := make(chan notify.EventInfo, 128)
-	// Watch for new day directories created in the month dir.
-	err := notify.Watch(monthDir, l, notify.InCreate)
-	if err != nil {
-		return err
-	}
-	defer notify.Stop(l)
-
-	for {
-		select {
-		case ev := <-l:
-			// now := time.Now().UTC()
+func watchCurrentMonth(t time.Time, dir string) error {
+	watch(dir, t, waitUntil(t, nextMonth),
+		// onEvent
+		func(t time.Time, ev notify.EventInfo) error {
 			switch ev.Event() {
 			case notify.InCreate:
-				fmt.Printf("watchMonth saw: %s\n", ev.Path())
-				go watchDay(ev.Path())
-				fmt.Printf("watching day\n")
-				//if err != nil {
-				//	// TODO: how to continue watching???
-				//	return err
-				//}
-			default:
-				// No change.
+				// Only watch new directories that match the current month.
+				curDay := fmt.Sprintf("%02d", t.Day())
+				newDay := filepath.Base(ev.Path())
+				if curDay == newDay {
+					fmt.Println("Watching new day created!", newDay)
+					go watchCurrentDay(t, ev.Path())
+				}
 			}
-		}
-	}
+			// fmt.Println("Month event!", ev)
+			return nil
+		},
+	)
+	return nil
 }
 
-func watchDay(dayDir string) error {
-	// Make the channel buffered to ensure no event is dropped. Notify will
-	// drop events if the receiver does not keep up.
-	l := make(chan notify.EventInfo, 128)
+func isDir(ev notify.EventInfo) bool {
+	unixEv, ok := ev.Sys().(*unix.InotifyEvent)
+	if !ok {
+		return false
+	}
+	return unixEv.Mask&unix.IN_ISDIR != 0
+}
 
-	// TODO: what is the difference the notify library creates between Create & InCreate, etc?
-	// err := notify.Watch(dir, listener, notify.Create, notify.Remove, notify.Rename, notify.InCloseWrite)
-	err := notify.Watch(dayDir, l, notify.InCreate, notify.InDelete, notify.Rename, notify.InCloseWrite)
+func watchCurrentDay(t time.Time, dir string) error {
+
+	if !strings.HasSuffix(dir, currentDir(t)) {
+		fmt.Printf("%s does not have expected suffix %s\n", dir, currentDir(t))
+		return fmt.Errorf("%s does not have expected suffix %s\n", dir, currentDir(t))
+	}
+
+	logger, err := NewLogger(t)
 	if err != nil {
 		return err
 	}
 
-	// TODO: do we need to handle the Stop case?
-	defer notify.Stop(l)
-	watchEventsForever(l)
+	fileCount := 0
+	// Setup a recursive watch on the day directory.
+	watch(fmt.Sprintf("%s/...", dir), t, waitUntil(t, nextDay),
+		// onEvent
+		func(t time.Time, ev notify.EventInfo) error {
+			// TODO:can we distinguish between files and dirs on delete
+			// events?
+			// Only count files.
+			if !isDir(ev) {
+				switch ev.Event() {
+				case notify.InCreate:
+					fileCount += 1
+				case notify.InDelete:
+					fileCount -= 1
+				default:
+					// No change.
+				}
+			}
+			// fmt.Println("Day event!", ev)
+			logger.Event(t, ev, fileCount)
+			return nil
+		},
+	)
+	logger.Close()
 	return nil
 }
 
 func main() {
 	flag.Parse()
 	// Watch root dir.
+	//
 	// If first start, immediately add watches for current date, if present:
 	// * YYYY
 	// * YYYY/MM
@@ -254,7 +293,7 @@ func main() {
 	fmt.Printf("Watching: %s\n", *rootPath)
 	for {
 		start := time.Now().UTC()
-		err := watchRoot(*rootPath, start)
+		err := watchRoot(start, *rootPath)
 		if err != nil {
 			log.Fatal(err)
 		}
