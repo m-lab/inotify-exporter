@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,16 +32,18 @@ import (
 )
 
 var (
-	rootPath = flag.String("path", "", "Path of root directory to watch.")
+	rootPath   = flag.String("path", "", "Path of root directory to watch.")
+	dirPattern = regexp.MustCompile("20[0-9]{2}/[01][0-9]/[0123][0-9]")
 )
 
 type iNotifyLogger struct {
 	*os.File
+	Count int
 }
 
-// which comes first the date or the directory?
-func currentDir(t time.Time) string {
-	return fmt.Sprintf("%04d/%02d/%02d", t.Year(), (int)(t.Month()), t.Day())
+type LogSet struct {
+	Loggers   map[string]*iNotifyLogger
+	dirPrefix string
 }
 
 // fixedRFC3339Nano guarantees a fixed format RFC3339 time format. The Go
@@ -51,29 +55,56 @@ func fixedRFC3339Nano(t time.Time) string {
 		t.Hour(), t.Minute(), t.Second(), t.Nanosecond())
 }
 
-func NewLogger(t time.Time) (*iNotifyLogger, error) {
+// which comes first the date or the directory?
+func currentDir(t time.Time) string {
+	return fmt.Sprintf("%04d/%02d/%02d", t.Year(), (int)(t.Month()), t.Day())
+}
+
+func NewLogSet(prefix string) *LogSet {
+	return &LogSet{make(map[string]*iNotifyLogger), prefix}
+}
+
+func (ls *LogSet) GetLogger(datePath string, ev notify.EventInfo) (*iNotifyLogger, error) {
+
+	if ev.Event() == notify.InDelete {
+		if strings.HasSuffix(ev.Path(), ".inotify.log") {
+			// If this is a delete event of an inotify.log file, remove the
+			// corresponding logger.
+			fmt.Fprintf(os.Stdout, "Deleting: %s\n", ev.Path())
+			delete(ls.Loggers, datePath)
+			// Do not attempt to re-create a log for a log just deleted.
+			return nil, fmt.Errorf("%s deleted.", ev.Path())
+		}
+	}
+
+	if l, ok := ls.Loggers[datePath]; ok {
+		return l, nil
+	}
+
+	// TODO: make this rotate hourly, somehow.
+	t := dirDate(datePath)
+
 	// For example: 20170828T14:27:27.480836000Z.inotify.log
-	d, err := os.Getwd()
-	os.Chdir("2017/08/29")
-	// fname := fmt.Sprintf("%s/%04d/%02d/%02d/%04d%02d%02dT%02d%02d%02d.%09dZ.inotify.log",
-	fname := fmt.Sprintf("%04d%02d%02dT%02d%02d%02d.%09dZ.inotify.log",
-		//d,
-		//t.Year(), (int)(t.Month()), t.Day(),
+	fname := fmt.Sprintf("%s/%04d/%02d/%02d/%04d%02d%02dT%02d:%02d:%02d.%09dZ.inotify.log",
+		ls.dirPrefix,
+		t.Year(), (int)(t.Month()), t.Day(),
 		t.Year(), (int)(t.Month()), t.Day(), t.Hour(), 0, 0, 0)
 
 	fmt.Fprintf(os.Stdout, "Creating: %s\n", fname)
-	fmt.Fprintf(os.Stdout, "pwd: %s %s\n", d, err)
-	file, err := os.OpenFile(fname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// Create is missing, append if present.
+	file, err := os.OpenFile("/dev/null", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
-	return &iNotifyLogger{file}, nil
+	l := &iNotifyLogger{file, 0}
+	ls.Loggers[datePath] = l
+	return l, nil
 }
 
-func (l *iNotifyLogger) Event(date time.Time, event notify.EventInfo, count int) {
+func (l *iNotifyLogger) Event(date time.Time, event notify.EventInfo) {
 	p := event.Path()
 	msg := fmt.Sprintf(
-		"%s %s %s %d\n", fixedRFC3339Nano(date), event.Event(), p[len(*rootPath)+1:], count)
+		"%s %s %s %d\n", fixedRFC3339Nano(date), event.Event(), p[len(*rootPath)+1:], l.Count)
 	fmt.Fprintf(l, msg)
 	fmt.Printf(msg)
 }
@@ -101,10 +132,6 @@ func watch(dir string, startTime, until time.Time,
 	alarm := time.After(waitTime)
 
 	// TODO: we must guarantee that the day directory matches the start time.
-	// logger, err := NewLogger(startTime)
-	// if err != nil {
-	// 	return err
-	// }
 
 	// TODO: vim on save, causes an InCreate event but no corresponding
 	// InDelete. This results in the count increasing without the number of
@@ -123,17 +150,17 @@ func watch(dir string, startTime, until time.Time,
 }
 
 const (
-	nextDay int = iota
+	nextDay1 int = iota
 	nextMonth
 	nextYear
 	nextRagnarok
 )
 
 // waitUntil returns a time.Time of the next calendar day, month or year, plus one hour.
-func waitUntil(startTime time.Time, d int) time.Time {
+func timeAfter(startTime time.Time, d int) time.Time {
 	// Note: time.Date normalizes dates; e.g. October 32 converts to November 1.
 	switch d {
-	case nextDay:
+	case nextDay1:
 		return time.Date(startTime.Year(), startTime.Month(), startTime.Day()+1, 1, 0, 0, 0, time.UTC)
 	case nextMonth:
 		return time.Date(startTime.Year(), startTime.Month()+1, startTime.Day(), 1, 0, 0, 0, time.UTC)
@@ -145,6 +172,21 @@ func waitUntil(startTime time.Time, d int) time.Time {
 	}
 }
 
+// nextDay
+func nextDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
+// Converts a "YYYY/MM/DD" string into a time.Time.
+func dirDate(datePath string) time.Time {
+	// TODO: add some kind of check.
+	y, _ := strconv.Atoi(datePath[:4])
+	m, _ := strconv.Atoi(datePath[5:7])
+	d, _ := strconv.Atoi(datePath[8:])
+	return time.Date(y, (time.Month)(m), d, 0, 0, 0, 0, time.UTC)
+}
+
+// isDir checks whether the event applied to a directory.
 func isDir(ev notify.EventInfo) bool {
 	unixEv, ok := ev.Sys().(*unix.InotifyEvent)
 	if !ok {
@@ -153,43 +195,94 @@ func isDir(ev notify.EventInfo) bool {
 	return unixEv.Mask&unix.IN_ISDIR != 0
 }
 
+// isValidPath checks whether the path matches the YYYY/MM/DD directory pattern
+// after stripping the prefix from path.
+func isValidPath(shortPath string) bool {
+
+	if len(shortPath) < 10 {
+		return false
+	}
+
+	// If the pattern doesn't match, then we don't care about this event.
+	if !dirPattern.MatchString(shortPath) {
+		return false
+	}
+
+	return true
+}
+
+func isInLoggingWindow(datePath string, evTime time.Time, d time.Duration) bool {
+
+	// Check that the event time is within duration window around the path Time.
+	pathTime := dirDate(datePath)
+	// (pathTime - d) < evTime < (nextDay(pathTime) + d)
+	if evTime.After(pathTime.Add(-d)) &&
+		evTime.Before(nextDay(pathTime).Add(d)) {
+		return true
+	}
+
+	return false
+}
+
 func watchCurrentDay(t time.Time, dir string) error {
-	fileCount := 0
+	logs := NewLogSet(dir)
 	// Setup a recursive watch on the day directory.
-	watch(fmt.Sprintf("%s/...", dir), t, waitUntil(t, nextRagnarok),
+	watch(fmt.Sprintf("%s/...", dir), t, timeAfter(t, nextRagnarok),
 		// onEvent
 		func(t time.Time, ev notify.EventInfo) error {
-			// TODO:can we distinguish between files and dirs on delete
-			// events?
+			// TODO:can we distinguish between files and dirs on delete events?
 			// Only count files.
-			if !isDir(ev) {
-				p := ev.Path()
-				shortPath := p[len(dir)+1:]
 
-				fmt.Fprintln(os.Stdout, "shortPath:", shortPath)
-				fmt.Fprintln(os.Stdout, "currentDir:", currentDir(t))
-				if strings.HasPrefix(shortPath, currentDir(t)) {
-					// Then this is a file event under a directory we care about.
-					fmt.Fprintln(os.Stdout, "Look up logger for:", currentDir(t))
-					logger, err := NewLogger(t)
-					if err != nil {
-						log.Fatal(err)
-					}
-					switch ev.Event() {
-					case notify.InCreate:
-						fileCount += 1
-					case notify.InDelete:
-						fileCount -= 1
-					default:
-						// No change.
-					}
-					// fmt.Println("Day event!", ev)
-					logger.Event(t, ev, fileCount)
-					// logger.Close()
-				} else {
-					fmt.Fprintln(os.Stdout, "Skipping event for: %s", ev)
-				}
+			// TODO: use two levels; watch dirs and watch for a day on valid dirs.
+			// This handles resource cleanup.
+			if isDir(ev) {
+				fmt.Printf("Dir: %s\n", ev)
+				return nil
 			}
+
+			// Only consider paths that are under dir. This is a sanity check.
+			if !strings.HasPrefix(ev.Path(), dir) {
+				fmt.Printf("prefix failed: %s\n", ev)
+				return nil
+			}
+
+			// Only accept paths that are valid and current within an hour.
+			shortPath := strings.TrimPrefix(ev.Path(), dir+"/")
+			if !isValidPath(shortPath) {
+				fmt.Printf("invalid path: %s\n", shortPath)
+				return nil
+			}
+
+			if !isInLoggingWindow(shortPath[:10], t, time.Hour) {
+				// TODO: try logger close, to prevent resource leaks.
+				fmt.Printf("bad window: %s %s\n", shortPath, t)
+				return nil
+			}
+
+			// At this point, the event is:
+			//  * for a file
+			//  * under a valid path, e.g. yyyy/mm/dd/foobar.gz
+			//  * within the current logging window.
+
+			logger, err := logs.GetLogger(shortPath[:10], ev)
+			if err != nil {
+				// Probably failed to create the log file.
+				log.Printf("Ignoring: %s %s", err, ev)
+				return nil
+			}
+
+			switch ev.Event() {
+			case notify.InCreate:
+				logger.Count += 1
+			case notify.InDelete:
+				logger.Count -= 1
+			default:
+				// No change.
+			}
+
+			// TODO: if we observe delete events for the log file we should
+			// remove that log from the LogSet.
+			logger.Event(t, ev)
 			return nil
 		},
 	)
