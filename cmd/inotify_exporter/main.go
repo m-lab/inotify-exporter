@@ -172,8 +172,9 @@ func timeAfter(startTime time.Time, d int) time.Time {
 	}
 }
 
-// nextDay
+// nextDay returns a time.Time of the next calendar day.
 func nextDay(t time.Time) time.Time {
+	// Note: time.Date normalizes dates; e.g. October 32 converts to November 1.
 	return time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, time.UTC)
 }
 
@@ -211,6 +212,7 @@ func isValidPath(shortPath string) bool {
 	return true
 }
 
+// isInLoggingWindow checks whether the event time occurs within a window around the date.
 func isInLoggingWindow(datePath string, evTime time.Time, d time.Duration) bool {
 
 	// Check that the event time is within duration window around the path Time.
@@ -230,11 +232,11 @@ func watchCurrentDay(t time.Time, dir string) error {
 	watch(fmt.Sprintf("%s/...", dir), t, timeAfter(t, nextRagnarok),
 		// onEvent
 		func(t time.Time, ev notify.EventInfo) error {
-			// TODO:can we distinguish between files and dirs on delete events?
-			// Only count files.
 
 			// TODO: use two levels; watch dirs and watch for a day on valid dirs.
 			// This handles resource cleanup.
+
+			// Only count files.
 			if isDir(ev) {
 				fmt.Printf("Dir: %s\n", ev)
 				return nil
@@ -303,12 +305,13 @@ func main() {
 	//
 	// When we add a new month or add a new day, we can stop monitoring the
 	// previous one shortly after.
+	//
 	// So, at all times, there should be at least:
 	// * one year watcher.
 	// * one month watcher.
 	// * one day watcher.
 	//
-	// Each watcher will have a time associated with it. When an event occurs,
+	// Each watcher will have a date associated with it. When an event occurs,
 	// it can check the date. If the date is in the future, we can stop
 	// watching.
 	//
@@ -323,7 +326,6 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-
 	// watchYear()
 	// watchMonth()
 	// err := watchDay(*rootPath)
