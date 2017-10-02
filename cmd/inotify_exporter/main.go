@@ -68,9 +68,10 @@ func NewLogSet(prefix string) *LogSet {
 	return &LogSet{make(map[string]*iNotifyLogger), prefix}
 }
 
-func (ls *LogSet) GetLogger(datePath string, ev notify.EventInfo) (*iNotifyLogger, error) {
+// func (ls *LogSet) GetLogger(datePath string, ev notify.EventInfo, evTime time.Time) (*iNotifyLogger, error) {
+func (ls *LogSet) GetLogger(datePath string, evTime time.Time) (*iNotifyLogger, error) {
 
-	if ev.Event() == notify.InDelete {
+	/* if ev.Event() == notify.InDelete {
 		if strings.HasSuffix(ev.Path(), ".inotify.log") {
 			// If this is a delete event of an inotify.log file, remove the
 			// corresponding logger.
@@ -79,10 +80,13 @@ func (ls *LogSet) GetLogger(datePath string, ev notify.EventInfo) (*iNotifyLogge
 			// Do not attempt to re-create a log for a log just deleted.
 			return nil, fmt.Errorf("%s deleted.", ev.Path())
 		}
-	}
+	}*/
 
 	if l, ok := ls.Loggers[datePath]; ok {
+		fmt.Printf("Returning existing logger for %s\n", datePath)
 		return l, nil
+	} else {
+		fmt.Printf("Creating logger for %s\n", datePath)
 	}
 
 	// TODO: make this rotate hourly, somehow.
@@ -91,7 +95,7 @@ func (ls *LogSet) GetLogger(datePath string, ev notify.EventInfo) (*iNotifyLogge
 	// For example: 20170828T14:27:27.480836000Z.inotify.log
 	fname := fmt.Sprintf("%s/%04d%02d%02dT%02d:%02d:%02d.%09dZ.inotify.log",
 		ls.dirPrefix,
-		t.Year(), (int)(t.Month()), t.Day(), t.Hour(), t.Minute(), t.Second(), 0)
+		t.Year(), (int)(t.Month()), t.Day(), evTime.Hour(), evTime.Minute(), evTime.Second(), 0)
 	// fname := fmt.Sprintf("%s/%04d/%02d/%02d/%04d%02d%02dT%02d:%02d:%02d.%09dZ.inotify.log",
 	// 	ls.dirPrefix,
 	// 	t.Year(), (int)(t.Month()), t.Day(),
@@ -117,7 +121,7 @@ func (l *iNotifyLogger) Event(date time.Time, event notify.EventInfo) {
 	fmt.Printf(msg)
 }
 
-func watch(dir string, startTime, until time.Time,
+func watchDir(dir string, startTime, until time.Time,
 	onEvent func(t time.Time, ev notify.EventInfo) error) error {
 
 	// Make the channel buffered to ensure no event is dropped. Notify will
@@ -148,10 +152,69 @@ func watch(dir string, startTime, until time.Time,
 	for {
 		select {
 		case ev := <-l:
+			if !isDir(ev) {
+				fmt.Printf("File events on '%s' are ignored! %s\n", dir, ev)
+				continue
+			}
 			t := time.Now().UTC()
 			onEvent(t, ev)
 		case <-alarm:
 			return nil
+		}
+	}
+	return nil
+}
+
+// watchDay expects that dir includes the sub-path YYYY/MM/DD and creates a logger
+// that will be passed to all events. After 'endTime', the watch will close the logger
+// and return.
+func watchDay(dayDir string, startTime, until time.Time,
+	datePrefix string, onEvent func(t time.Time, ev notify.EventInfo, logger *iNotifyLogger) error) error {
+
+	// Notify will drop events if the receiver does not keep up. So, make the
+	// channel buffered to ensure no event is dropped.
+	c := make(chan notify.EventInfo, 128)
+
+	// Start a recursive watch on dayDir.
+	err := notify.Watch(fmt.Sprintf("%s/...", dayDir), c, notify.InCreate, notify.InDelete, notify.InCloseWrite)
+	if err != nil {
+		return err
+	}
+
+	// Removes all watchpoints registered for c.
+	defer notify.Stop(c)
+
+	// TODO: check that until is larger than starttime.
+	// The until time should always be larger than now.
+	waitTime := until.Sub(startTime)
+
+	fmt.Printf("Watching %s for: %s\n", dayDir, waitTime)
+	alarm := time.After(waitTime)
+
+	// TODO: we must guarantee that the day directory matches the start time.
+
+	// TODO: vim on save, causes an InCreate event but no corresponding
+	// InDelete. This results in the count increasing without the number of
+	// files actually increasing. How is this possible?
+
+	// TODO: simplify the NewLogSet logic.
+	logs := NewLogSet(dayDir)
+	logger, err := logs.GetLogger(datePrefix, startTime)
+	if err != nil {
+		// Probably failed to create the log file.
+		log.Printf("Failed to get logger: %s %s", err, datePrefix)
+		return nil
+	}
+
+	for waitForEvents := true; waitForEvents; {
+		select {
+		case ev := <-c:
+			// Process all events, since this is a recursive watch.
+			t := time.Now().UTC()
+			onEvent(t, ev, logger)
+		case <-alarm:
+			logger.Close()
+			waitForEvents = false
 		}
 	}
 	return nil
@@ -268,10 +331,11 @@ func getPathSuffix(prefixDir, eventPath string) string {
 	return strings.TrimPrefix(eventPath, prefixDir+"/")
 }
 
-func tryToWatch(start time.Time, dir string, watchDir func(t time.Time, d string) error) error {
+// func tryToWatch(dir, datePath string, start time.Time, end time.Time, watchDir func(d, p string, t time.Time) error) {
+func tryToWatch(start time.Time, dir, datePrefix string, watchDir func(t time.Time, d, p string) error) error {
 	go func() {
 		// Start watching the new year directory.
-		err := watchDir(start, dir)
+		err := watchDir(start, dir, datePrefix)
 		if err != nil {
 			fmt.Printf("Failure to watch dir: %s %s\n", dir, err)
 			return
@@ -280,12 +344,12 @@ func tryToWatch(start time.Time, dir string, watchDir func(t time.Time, d string
 	return nil
 }
 
-func watchRoot(start time.Time, dir string) error {
+func watchRoot(start time.Time, rootDir string) error {
 	// Dir is the root directory. Immediately check for and add a watch to the
 	// current year and month directories if present.
-	tryToWatch(start, dir+"/"+formatYear(start), watchYear)
+	tryToWatch(start, rootDir+"/"+formatYear(start), formatYear(start), watchYear)
 
-	watch(fmt.Sprintf("%s", dir), start, timeAfter(start, nextForever),
+	watchDir(fmt.Sprintf("%s", rootDir), start, timeAfter(start, nextForever),
 		func(t time.Time, ev notify.EventInfo) error {
 			if !isDir(ev) {
 				fmt.Printf("We should not see file events on root path! %s\n", ev)
@@ -293,27 +357,28 @@ func watchRoot(start time.Time, dir string) error {
 			}
 
 			// only accept paths that follow the YYYY directory pattern.
-			shortPath := getPathSuffix(dir, ev.Path())
+			shortPath := getPathSuffix(rootDir, ev.Path())
 			if !isValidYear(shortPath) {
 				fmt.Printf("Invalid direcctory name for year: %s\n", shortPath)
 				return nil
 			}
 
 			if formatYear(t) != shortPath {
-				fmt.Printf("New year directory does not match current year: %s vs %s\n", shortPath, t.Year())
+				fmt.Printf("New year directory does not match current year: %s vs %d\n",
+					shortPath, t.Year())
 				return nil
 			}
 
-			tryToWatch(t, ev.Path(), watchYear)
+			tryToWatch(t, ev.Path(), shortPath, watchYear)
 			return nil
 		},
 	)
 	return nil
 }
 
-func watchYear(start time.Time, yearDir string) error {
-	tryToWatch(start, yearDir+"/"+formatMonth(start), watchMonth)
-	watch(fmt.Sprintf("%s", yearDir), start, timeAfter(start, nextYear),
+func watchYear(start time.Time, yearDir, datePrefix string) error {
+	tryToWatch(start, yearDir+"/"+formatMonth(start), datePrefix+"/"+formatMonth(start), watchMonth)
+	watchDir(fmt.Sprintf("%s", yearDir), start, timeAfter(start, nextYear),
 		func(t time.Time, ev notify.EventInfo) error {
 			if !isDir(ev) {
 				fmt.Printf("We should not see file events on root path! %s\n", ev)
@@ -332,16 +397,17 @@ func watchYear(start time.Time, yearDir string) error {
 				return nil
 			}
 
-			tryToWatch(t, ev.Path(), watchMonth)
+			tryToWatch(t, ev.Path(), datePrefix+"/"+shortPath, watchMonth)
 			return nil
 		},
 	)
 	return nil
 }
 
-func watchMonth(start time.Time, monthDir string) error {
-	tryToWatch(start, monthDir+"/"+formatDay(start), watchCurrentDay)
-	watch(fmt.Sprintf("%s", monthDir), start, timeAfter(start, nextMonth),
+func watchMonth(start time.Time, monthDir, datePrefix string) error {
+	d := datePrefix + "/" + formatDay(start)
+	tryToWatch(start, monthDir+"/"+formatDay(start), d, watchCurrentDay)
+	watchDir(fmt.Sprintf("%s", monthDir), start, timeAfter(start, nextMonth),
 		func(t time.Time, ev notify.EventInfo) error {
 			if !isDir(ev) {
 				fmt.Printf("We should not see file events on root path! %s\n", ev)
@@ -355,25 +421,33 @@ func watchMonth(start time.Time, monthDir string) error {
 				return nil
 			}
 
-			if formatDay(t) != shortPath {
-				fmt.Printf("New day directory does not match current day: %s vs %02d\n", shortPath, t.Day())
-				return nil
+			// Relative to the current time, the new shortPath may represent:
+			//  * an earlier date than the current time. This we can ignore.
+			//  * the current time, try to watch now
+			//  * a later date, setup timer to watch later.
+			dt := dirDate(d)
+			if dt.Year() == t.Year() && dt.Month() == t.Month() && dt.Day() == t.Day() {
+				tryToWatch(t, ev.Path(), d, watchCurrentDay)
+			} else if dt.After(t) {
+				// tryToWatch(t, ev.Path(), d, watchCurrentDay)
+				fmt.Println("TODO: watch the next day.", dt)
 			}
 
-			tryToWatch(t, ev.Path(), watchCurrentDay)
 			return nil
 		},
 	)
 	return nil
 }
 
-func watchCurrentDay(t time.Time, dayDir string) error {
-	logs := NewLogSet(dayDir)
+func watchCurrentDay(t time.Time, dayDir, datePrefix string) error {
+	// logs := NewLogSet(dayDir)
 	prefix := dayDir[:len(dayDir)-10]
+	fmt.Println("prefix", dayDir[len(dayDir)-10:])
+	fmt.Println("datePrefix", datePrefix)
 	// Setup a recursive watch on the day directory, lasting until the next day.
-	watch(fmt.Sprintf("%s/...", dayDir), t, timeAfter(t, nextDay1),
+	watchDay(dayDir, t, timeAfter(t, nextDay1), datePrefix,
 		// onEvent
-		func(t time.Time, ev notify.EventInfo) error {
+		func(t time.Time, ev notify.EventInfo, logger *iNotifyLogger) error {
 
 			// TODO: use two levels; watch dirs and watch for a day on valid dirs.
 			// This handles resource cleanup.
@@ -407,13 +481,6 @@ func watchCurrentDay(t time.Time, dayDir string) error {
 			//  * for a file
 			//  * under a valid path, e.g. yyyy/mm/dd/foobar.gz
 			//  * within the current logging window.
-
-			logger, err := logs.GetLogger(shortPath[:10], ev)
-			if err != nil {
-				// Probably failed to create the log file.
-				log.Printf("Ignoring: %s %s", err, ev)
-				return nil
-			}
 
 			switch ev.Event() {
 			case notify.InCreate:
@@ -463,21 +530,8 @@ func main() {
 	for {
 		start := time.Now().UTC()
 		err := watchRoot(start, *rootPath)
-		// err := watchCurrentDay(start, *rootPath)
 		if err != nil {
 			log.Fatal(err)
 		}
 	}
-
-	// watchRoot(date)
-	//   once(
-	//       watch YYYY, YYYY/MM
-	//   )
-	//   watchCurrentDay(YYYY/MM/DD)
-	// watchYear()
-	// watchMonth()
-	// err := watchDay(*rootPath)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
 }
