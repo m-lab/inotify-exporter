@@ -36,10 +36,10 @@ var (
 	rootPath   = flag.String("path", "", "Path of root directory to watch.")
 	dirPattern = regexp.MustCompile("20[0-9]{2}/[01][0-9]/[0123][0-9]")
 
-	yearPattern  = regexp.MustCompile("20[0-9]{2}")
-	monthPattern = regexp.MustCompile("0[1-9]|1[0-2]")
-	dayPattern   = regexp.MustCompile("0[1-9]|[12][0-9]|3[0-1]")
-	watches      = &activeWatches{make(map[string]chan notify.EventInfo)}
+	yearPattern   = regexp.MustCompile("20[0-9]{2}")
+	monthPattern  = regexp.MustCompile("0[1-9]|1[0-2]")
+	dayPattern    = regexp.MustCompile("0[1-9]|[12][0-9]|3[0-1]")
+	activeWatches = &watches{make(map[string]chan notify.EventInfo), sync.Mutex{}}
 )
 
 // iNotifyLogger tracks metadata for logging file events.
@@ -54,26 +54,35 @@ type iNotifyLogger struct {
 	Prefix string
 }
 
-type activeWatches struct {
+type watches struct {
 	channel map[string]chan notify.EventInfo
 	mux     sync.Mutex
 }
 
-func (aw *activeWatches) AddWatchIfMissing(path, wc chan notify.EventInfo) bool {
+func (aw *watches) AddIfMissing(path string, wc chan notify.EventInfo) bool {
 	aw.mux.Lock()
 	defer aw.mux.Unlock()
-	c, ok := m[path]
-	if !ok {
-		m[path] = wc
+	if _, ok := aw.channel[path]; !ok {
+		aw.channel[path] = wc
 		return true
 	}
 	return false
 }
 
-func (aw *activeWatches) RemoveWatch(path) {
+func (aw *watches) Remove(path string) {
 	aw.mux.Lock()
 	defer aw.mux.Unlock()
 	delete(aw.channel, path)
+}
+
+func (aw *watches) DebugPrint() {
+	fmt.Println("printing current watches")
+	aw.mux.Lock()
+	defer aw.mux.Unlock()
+	for k, v := range aw.channel {
+		fmt.Println("watch:", k, v)
+	}
+	fmt.Println("done printing")
 }
 
 // fixedRFC3339Nano guarantees a fixed format RFC3339 time format. The Go
@@ -120,6 +129,7 @@ func (l *iNotifyLogger) Event(t time.Time, ev notify.EventInfo) {
 }
 
 func watchDir(dir string, startTime, until time.Time,
+	afterWatch func(),
 	onCreate func(t time.Time, ev notify.EventInfo) error) {
 
 	// Notify drops events if the receiver does not keep up.
@@ -133,17 +143,22 @@ func watchDir(dir string, startTime, until time.Time,
 		fmt.Println("Shutting down channel for", dir)
 		notify.Stop(c)
 	}()
+	if !activeWatches.AddIfMissing(dir, c) {
+		// Return triggers the defer operaitons above.
+		return
+	}
+	defer func() {
+		// At this point we added a watch above, and should remove it before
+		// leaving this function.
+		activeWatches.Remove(dir)
+	}()
+	afterWatch()
 
 	// TODO: check that until is larger than starttime.
 	// The until time should always be larger than now.
 	waitTime := until.Sub(startTime)
-	// TODO: log the wait time.
 	fmt.Printf("Watching %s for: %s\n", dir, waitTime)
 	alarm := time.After(waitTime)
-
-	// TODO: vim on save, causes an InCreate event but no corresponding
-	// InDelete. This results in the count increasing without the number of
-	// files actually increasing. How is this possible?
 
 	for {
 		select {
@@ -188,12 +203,20 @@ func watchDay(dayDir string, startTime, until time.Time,
 		fmt.Printf("DAY: Failed to add watch: %s\n", err)
 		return err
 	}
-
 	defer func() {
 		fmt.Println("Shutting down channel for", dayDir)
-		// Removes all watchpoints registered for c.
 		notify.Stop(c)
 	}()
+	if !activeWatches.AddIfMissing(dayDir, c) {
+		// Return triggers the defer operaitons above.
+		return nil
+	}
+	defer func() {
+		// At this point we added a watch above, and should remove it before
+		// leaving this function.
+		activeWatches.Remove(dayDir)
+	}()
+	// afterWatch()
 
 	// TODO: check that until is larger than starttime.
 	// The until time should always be larger than now.
@@ -322,11 +345,12 @@ func getPathSuffix(prefixDir, eventPath string) string {
 }
 
 func watchRoot(start time.Time, rootDir string) error {
-	// Immediately try to add a watch for the current year.
-	go watchYear(start, rootDir+"/"+formatYear(start))
-
 	// Watch the rootDir for new year directory events, effectively forever.
 	watchDir(rootDir, start, untilForever,
+		func() {
+			// Try to add a watch for the current year.
+			go watchYear(start, rootDir+"/"+formatYear(start))
+		},
 		func(t time.Time, ev notify.EventInfo) error {
 			// Only accept paths that follow the YYYY directory pattern.
 			shortPath := getPathSuffix(rootDir, ev.Path())
@@ -344,11 +368,12 @@ func watchRoot(start time.Time, rootDir string) error {
 }
 
 func watchYear(start time.Time, yearDir string) error {
-	// Immediately try to add a watch for the current month.
-	go watchMonth(start, yearDir+"/"+formatMonth(start))
-
 	// Watch the yearDir for new month directory events, until next year.
 	watchDir(yearDir, start, untilTime(start, nextYear),
+		func() {
+			// Immediately try to add a watch for the current month.
+			go watchMonth(start, yearDir+"/"+formatMonth(start))
+		},
 		func(t time.Time, ev notify.EventInfo) error {
 			// Only accept paths that follow the MM directory pattern.
 			shortPath := getPathSuffix(yearDir, ev.Path())
@@ -366,11 +391,12 @@ func watchYear(start time.Time, yearDir string) error {
 }
 
 func watchMonth(start time.Time, monthDir string) error {
-	// Immediately try to add a watch for the current day.
-	go watchCurrentDay(start, monthDir+"/"+formatDay(start))
-
 	// Watch the monthDir for new day directory events, until next month.
 	watchDir(monthDir, start, untilTime(start, nextMonth),
+		func() {
+			// Immediately try to add a watch for the current day.
+			go watchCurrentDay(start, monthDir+"/"+formatDay(start))
+		},
 		func(t time.Time, ev notify.EventInfo) error {
 			// Only accept paths that follow the DD directory pattern.
 			shortPath := getPathSuffix(monthDir, ev.Path())
