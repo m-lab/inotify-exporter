@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rjeczalik/notify"
@@ -38,6 +39,7 @@ var (
 	yearPattern  = regexp.MustCompile("20[0-9]{2}")
 	monthPattern = regexp.MustCompile("0[1-9]|1[0-2]")
 	dayPattern   = regexp.MustCompile("0[1-9]|[12][0-9]|3[0-1]")
+	watches      = &activeWatches{make(map[string]chan notify.EventInfo)}
 )
 
 // iNotifyLogger tracks metadata for logging file events.
@@ -50,6 +52,28 @@ type iNotifyLogger struct {
 
 	// Prefix is a redundant directory prefix that can be stripped from logs.
 	Prefix string
+}
+
+type activeWatches struct {
+	channel map[string]chan notify.EventInfo
+	mux     sync.Mutex
+}
+
+func (aw *activeWatches) AddWatchIfMissing(path, wc chan notify.EventInfo) bool {
+	aw.mux.Lock()
+	defer aw.mux.Unlock()
+	c, ok := m[path]
+	if !ok {
+		m[path] = wc
+		return true
+	}
+	return false
+}
+
+func (aw *activeWatches) RemoveWatch(path) {
+	aw.mux.Lock()
+	defer aw.mux.Unlock()
+	delete(aw.channel, path)
 }
 
 // fixedRFC3339Nano guarantees a fixed format RFC3339 time format. The Go
