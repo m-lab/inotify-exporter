@@ -23,7 +23,7 @@ import (
 	"log"
 	"os"
 	"regexp"
-	"strconv"
+	//"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,13 +76,18 @@ func (aw *watches) Remove(path string) {
 }
 
 func (aw *watches) DebugPrint() {
-	fmt.Println("printing current watches")
+	fmt.Println("CURRENT WATCHES")
 	aw.mux.Lock()
 	defer aw.mux.Unlock()
+	count := 0
 	for k, v := range aw.channel {
-		fmt.Println("watch:", k, v)
+		fmt.Println("   watch:", k, v)
+		count += 1
 	}
-	fmt.Println("done printing")
+	if count == 0 {
+		fmt.Println("   watch: NONE")
+	}
+	fmt.Println("DONE")
 }
 
 // fixedRFC3339Nano guarantees a fixed format RFC3339 time format. The Go
@@ -94,21 +99,11 @@ func fixedRFC3339Nano(t time.Time) string {
 		t.Hour(), t.Minute(), t.Second(), t.Nanosecond())
 }
 
-func NewLogger(prefixDir string, evTime time.Time) (*iNotifyLogger, error) {
-
-	// Extract the YYYY/MM/DD suffix on dayDir.
-	yearMonthDay := prefixDir[len(prefixDir)-10:]
-	fmt.Printf("Creating logger for %s\n", yearMonthDay)
-	// TODO: make this rotate hourly, somehow.
-	t := dirDate(yearMonthDay)
-
+func NewLogger(prefixDir, yearMonthDay string, evTime time.Time) (*iNotifyLogger, error) {
 	// For example: 20170828T14:27:27.480836000Z.inotify.log
-	fname := fmt.Sprintf("%s/%04d%02d%02dT%02d:%02d:%02d.%09dZ.inotify.log",
-		prefixDir, t.Year(), (int)(t.Month()), t.Day(), 0, 0, 0, 0)
-	// fname := fmt.Sprintf("%s/%04d/%02d/%02d/%04d%02d%02dT%02d:%02d:%02d.%09dZ.inotify.log",
-	// 	ls.dirPrefix,
-	// 	t.Year(), (int)(t.Month()), t.Day(),
-	// 	t.Year(), (int)(t.Month()), t.Day(), t.Hour(), 0, 0, 0)
+	fname := fmt.Sprintf("%s/%s/%04d%02d%02dT%02d:%02d:%02d.%09dZ.inotify.log",
+		prefixDir, yearMonthDay, evTime.Year(), (int)(evTime.Month()), evTime.Day(),
+		evTime.Hour(), evTime.Minute(), evTime.Second(), evTime.Nanosecond())
 
 	fmt.Printf("Creating: %s\n", fname)
 	// Create if missing, append if present.
@@ -116,7 +111,7 @@ func NewLogger(prefixDir string, evTime time.Time) (*iNotifyLogger, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &iNotifyLogger{file, 0, prefixDir[:len(prefixDir)-10]}
+	l := &iNotifyLogger{file, 0, prefixDir}
 	return l, nil
 }
 
@@ -179,6 +174,7 @@ func watchDir(dir string, startTime, until time.Time,
 
 			t := time.Now().UTC()
 			onCreate(t, ev)
+			activeWatches.DebugPrint()
 		case <-alarm:
 			// TODO: do we need an alarm any more?
 			return
@@ -187,10 +183,12 @@ func watchDir(dir string, startTime, until time.Time,
 	return
 }
 
-// watchDay expects that dir includes the sub-path YYYY/MM/DD and creates a logger
-// that will be passed to all events. After 'endTime', the watch will close the logger
-// and return.
-func watchDay(dayDir string, startTime, until time.Time,
+// watchDay recursively watches create, delete, and closewrite events on
+// dayDir and subdirectories. The suffix of dayDir must end with a sub-path of
+// the form: YYYY/MM/DD. Every filesystem event triggers a call to onEvent,
+// with the time of the event, the event info, and a logger instance.  The
+// watch will remain active until dayDir is deleted.
+func watchDay(dayDir string, startTime time.Time,
 	onEvent func(t time.Time, ev notify.EventInfo, logger *iNotifyLogger) error) error {
 
 	// Notify will drop events if the receiver does not keep up. So, make the
@@ -198,7 +196,8 @@ func watchDay(dayDir string, startTime, until time.Time,
 	c := make(chan notify.EventInfo, 128)
 
 	// Start a recursive watch on dayDir.
-	err := notify.Watch(fmt.Sprintf("%s/...", dayDir), c, notify.InCreate, notify.InDelete, notify.InCloseWrite)
+	err := notify.Watch(fmt.Sprintf("%s/...", dayDir), c,
+		notify.InCreate, notify.InDelete, notify.InCloseWrite)
 	if err != nil {
 		fmt.Printf("DAY: Failed to add watch: %s\n", err)
 		return err
@@ -216,16 +215,12 @@ func watchDay(dayDir string, startTime, until time.Time,
 		// leaving this function.
 		activeWatches.Remove(dayDir)
 	}()
-	// afterWatch()
 
-	// TODO: check that until is larger than starttime.
-	// The until time should always be larger than now.
-	waitTime := until.Sub(startTime)
+	// Extract the directory prefix and the YYYY/MM/DD suffix from dayDir.
+	yearMonthDay := dayDir[len(dayDir)-10:]
+	prefixDir := dayDir[:len(dayDir)-10]
 
-	fmt.Printf("Watching %s for: %s\n", dayDir, waitTime)
-	alarm := time.After(waitTime)
-
-	logger, err := NewLogger(dayDir, startTime)
+	logger, err := NewLogger(prefixDir, yearMonthDay, startTime)
 	if err != nil {
 		log.Printf("Failed to create log file '%s': %s", dayDir, err)
 		return err
@@ -233,19 +228,16 @@ func watchDay(dayDir string, startTime, until time.Time,
 	defer logger.Close()
 
 	for {
-		select {
-		case ev := <-c:
-			// Process all events, since this is a recursive watch.
-			fmt.Printf("DAY EVENT for %s:\n\t%s\n", dayDir, ev)
-			if ev.Event() == notify.InDelete && dayDir == ev.Path() {
-				// The watched directory is being removed, so we're done here.
-				return nil
-			}
-			t := time.Now().UTC()
-			onEvent(t, ev, logger)
-		case <-alarm:
+		// Receive an event from the watch channel.
+		ev := <-c
+		fmt.Printf("DAY EVENT for %s:\n\t%s\n", dayDir, ev)
+		if ev.Event() == notify.InDelete && dayDir == ev.Path() {
+			// The watched directory is being removed, so we're done here.
 			return nil
 		}
+		// Process all other events, since this is a recursive watch.
+		t := time.Now().UTC()
+		onEvent(t, ev, logger)
 	}
 	return nil
 }
@@ -277,6 +269,7 @@ func untilTime(startTime time.Time, d int) time.Time {
 	}
 }
 
+/*
 // Converts a "YYYY/MM/DD" string into a time.Time.
 func dirDate(datePath string) time.Time {
 	// TODO: add some kind of check.
@@ -285,6 +278,7 @@ func dirDate(datePath string) time.Time {
 	d, _ := strconv.Atoi(datePath[8:])
 	return time.Date(y, (time.Month)(m), d, 0, 0, 0, 0, time.UTC)
 }
+*/
 
 // isDir checks whether the event applied to a directory.
 func isDir(ev notify.EventInfo) bool {
@@ -344,6 +338,40 @@ func getPathSuffix(prefixDir, eventPath string) string {
 	return strings.TrimPrefix(eventPath, prefixDir+"/")
 }
 
+/*
+func watchPath(start time.Time, prefixDir string, suffixPattern string,
+	formatDate func(t time.Time)) {
+
+	// watchDir(dir)
+	//   afterWatch:
+	//     watchPath(dir + / + formatDate(start))
+	//   onEvent:
+	//     isValidSuffix
+	//     if ev.Path() ends with suffixPattern
+	//       watchPath(t, ev.Path())
+	//
+
+	// Watch the yearDir for new month directory events, until next year.
+	watchDir(prefixDir, start, untilTime(start, nextForever),
+		func() {
+			// Try to add a watch for the current month.
+			go watchPath(start, path.Join(prefixDir, formatDate(start)))
+		},
+		func(t time.Time, ev notify.EventInfo) error {
+			// Only accept paths that follow the MM directory pattern.
+			if !suffixPattern.MatchString(ev.Path()) {
+				fmt.Printf("Invalid month path: '%s'\n", ev.Path())
+				fmt.Println(ev)
+				return nil
+			}
+			go watchPath(t, ev.Path())
+			return nil
+		},
+	)
+	return nil
+}
+*/
+
 func watchRoot(start time.Time, rootDir string) error {
 	// Watch the rootDir for new year directory events, effectively forever.
 	watchDir(rootDir, start, untilForever,
@@ -371,7 +399,7 @@ func watchYear(start time.Time, yearDir string) error {
 	// Watch the yearDir for new month directory events, until next year.
 	watchDir(yearDir, start, untilTime(start, nextYear),
 		func() {
-			// Immediately try to add a watch for the current month.
+			// Try to add a watch for the current month.
 			go watchMonth(start, yearDir+"/"+formatMonth(start))
 		},
 		func(t time.Time, ev notify.EventInfo) error {
@@ -394,7 +422,7 @@ func watchMonth(start time.Time, monthDir string) error {
 	// Watch the monthDir for new day directory events, until next month.
 	watchDir(monthDir, start, untilTime(start, nextMonth),
 		func() {
-			// Immediately try to add a watch for the current day.
+			// Try to add a watch for the current day.
 			go watchCurrentDay(start, monthDir+"/"+formatDay(start))
 		},
 		func(t time.Time, ev notify.EventInfo) error {
@@ -417,7 +445,7 @@ func watchCurrentDay(start time.Time, dayDir string) error {
 	prefixDir := dayDir[:len(dayDir)-10]
 
 	// watchDay watches recursively on the day directory, until the next day.
-	watchDay(dayDir, start, untilTime(start, nextDay),
+	watchDay(dayDir, start, // untilTime(start, nextDay),
 		// onEvent
 		func(t time.Time, ev notify.EventInfo, logger *iNotifyLogger) error {
 			// Only count files.
