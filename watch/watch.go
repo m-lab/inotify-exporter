@@ -25,7 +25,10 @@ var (
 
 // DirRecursively starts a recursive inotify watch on InCreate, InDelete, and
 // InCloseWrite events on baseDir and subdirectories. The watch will remain
-// active until the caller sends a value to the stop channel.
+// active until the caller closes the stop channel. DirRecursively calls
+// onEvent for events on files (not directories) that are under a directory
+// structure matching the pattern YYYY/MM/DD/*. Directory events or files in
+// other locations are ignored.
 func DirRecursively(baseDir string, stop <-chan struct{},
 	onEvent func(t time.Time, ev notify.EventInfo, shortPath string)) error {
 	// Notify will drop events if the receiver does not keep up. So, make the
