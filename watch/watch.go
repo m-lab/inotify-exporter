@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	// TODO: add vendor support for github.com/rjeczalik/notify
 	"github.com/rjeczalik/notify"
 )
 
@@ -25,7 +26,7 @@ var (
 // DirRecursively starts a recursive inotify watch on InCreate, InDelete, and
 // InCloseWrite events on baseDir and subdirectories. The watch will remain
 // active until the caller sends a value to the stop channel.
-func DirRecursively(baseDir string, stop <-chan bool,
+func DirRecursively(baseDir string, stop <-chan struct{},
 	onEvent func(t time.Time, ev notify.EventInfo, shortPath string)) error {
 	// Notify will drop events if the receiver does not keep up. So, make the
 	// channel buffered to ensure no event is dropped.

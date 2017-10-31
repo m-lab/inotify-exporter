@@ -107,7 +107,7 @@ func main() {
 	flag.Parse()
 
 	// Directories are watched indefinitely, so this is never used.
-	stop := make(chan bool)
+	stop := make(chan struct{})
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
 	for _, path := range rootPaths {

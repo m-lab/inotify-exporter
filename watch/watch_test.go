@@ -13,7 +13,7 @@ import (
 func TestDirRecursively(t *testing.T) {
 	done := make(chan bool)
 	events := make(chan string, 20)
-	stop := make(chan bool)
+	stop := make(chan struct{})
 
 	// Try to watch a directory that does not exist, should return immediately.
 	err := watch.DirRecursively("DirDoesNotExist", stop,
@@ -82,8 +82,8 @@ func TestDirRecursively(t *testing.T) {
 		t.Fatal("timeout waiting for event.")
 	}
 
-	// Send a stop signal to watch.DirRecursively so that it returns.
-	stop <- true
+	// Close channel to signal stop to watch.DirRecursively so that it returns.
+	close(stop)
 
 	// Verify that watch.DirRecursively returns.
 	select {
