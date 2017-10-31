@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	// TODO: add vendor support for github.com/rjeczalik/notify
 	"github.com/rjeczalik/notify"
 	flag "github.com/spf13/pflag"
 
@@ -117,5 +118,7 @@ func main() {
 	// The Handler function provides a default handler to expose metrics
 	// via an HTTP server. "/metrics" is the usual endpoint for that.
 	http.Handle("/metrics", promhttp.Handler())
+
+	// TODO: use a port that won't conflict with registered exporter ports.
 	log.Fatal(http.ListenAndServe(":9393", nil))
 }
