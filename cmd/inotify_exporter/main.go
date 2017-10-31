@@ -74,10 +74,10 @@ func init() {
 	flag.StringArrayVar(&rootPaths, "path", nil, "Path of root directory to watch.")
 }
 
-// onEvent processes a single inotify event. Only file events are considered.
-// shortPath should be relative to the base directory of inotify watch. The
-// prefix of shortPath should match the pattern: YYYY/MM/DD.
-func onEvent(t time.Time, ev notify.EventInfo, shortPath string) {
+// updateMetrics processes a single inotify event. Meant to be used with
+// watch.DirRecursively. On every file event, updateMetrics increments the
+// prometheus file extension counters.
+func updateMetrics(t time.Time, ev notify.EventInfo, shortPath string) {
 	// The event is for a file under a YYYY/MM/DD/* prefix.
 	switch ev.Event() {
 	case notify.InCreate:
@@ -112,7 +112,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
 	for _, path := range rootPaths {
 		log.Printf("Adding watch: %s\n", path)
-		go watch.DirRecursively(path, stop, onEvent)
+		go watch.DirRecursively(path, stop, updateMetrics)
 	}
 
 	// The Handler function provides a default handler to expose metrics
