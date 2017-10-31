@@ -64,15 +64,13 @@ func DirRecursively(baseDir string, stop <-chan struct{},
 
 		shortPath := getPathSuffix(baseDir, ev.Path())
 		// Only accept valid YYYY/MM/DD paths.
-		if !isValidPath(shortPath) {
-			continue
+		if isValidPath(shortPath) {
+			t := time.Now().UTC()
+			log.Printf("%s %s %s\n", t, ev.Event(), ev.Path())
+			// For all file events with a valid path, call the user-provided
+			// onEvent function.
+			onEvent(t, ev, shortPath)
 		}
-
-		t := time.Now().UTC()
-		log.Printf("%s %s %s\n", t, ev.Event(), ev.Path())
-		// Process all other events, since this is a recursive watch.
-		onEvent(t, ev, shortPath)
-
 	}
 	return nil
 }
