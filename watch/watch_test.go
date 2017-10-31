@@ -82,7 +82,7 @@ func TestDirRecursively(t *testing.T) {
 		t.Fatal("timeout waiting for event.")
 	}
 
-	// Close channel to signal stop to watch.DirRecursively so that it returns.
+	// Close channel to signal watch.DirRecursively to stop, so that it returns.
 	close(stop)
 
 	// Verify that watch.DirRecursively returns.
